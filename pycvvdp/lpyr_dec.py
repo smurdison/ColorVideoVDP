@@ -20,6 +20,7 @@ class lpyr_dec():
         self.min_freq = 0.2
         self.W = W
         self.H = H
+        self.symm_padd = False # Symmetric padding when True, zero padding when False
 
         max_levels = int(np.floor(np.log2(min(self.H, self.W))))-1
 
@@ -130,16 +131,17 @@ class lpyr_dec():
         new_shape[dim] = exp_size[dim]+4
         z = torch.zeros( new_shape, dtype=x.dtype, device=x.device)
         odd_no = (exp_size[dim]%2)
-        if dim==-2:
-            z[:,:,2:-2:2,:] = x
-            z[:,:,0,:] = x[:,:,0,:]
-            z[:,:,-2+odd_no,:] = x[:,:,-1,:]
-        elif dim==-1:
-            z[:,:,:,2:-2:2] = x
-            z[:,:,:,0] = x[:,:,:,0]
-            z[:,:,:,-2+odd_no] = x[:,:,:,-1]
-        else:
-            assert False, "Wrong dimension"
+        if self.symm_padd:
+            if dim==-2:
+                z[:,:,2:-2:2,:] = x
+                z[:,:,0,:] = x[:,:,0,:]
+                z[:,:,-2+odd_no,:] = x[:,:,-1,:]
+            elif dim==-1:
+                z[:,:,:,2:-2:2] = x
+                z[:,:,:,0] = x[:,:,:,0]
+                z[:,:,:,-2+odd_no] = x[:,:,:,-1]
+            else:
+                assert False, "Wrong dimension"
 
         return z
 
@@ -189,22 +191,24 @@ class lpyr_dec():
         B, C, H, W = x.shape
         y_a = Func.conv2d(x.view(-1,1,H,W), K_vert, stride=(2,1), padding=(2,0)).view(B,C,-1,W)
 
-        # Symmetric padding 
-        y_a[:,:,0,:] += x[:,:,0,:]*K_vert[0,0,1,0] + x[:,:,1,:]*K_vert[0,0,0,0]
-        if (x.shape[-2] % 2)==1: # odd number of rows
-            y_a[:,:,-1,:] += x[:,:,-1,:]*K_vert[0,0,3,0] + x[:,:,-2,:]*K_vert[0,0,4,0]
-        else: # even number of rows
-            y_a[:,:,-1,:] += x[:,:,-1,:]*K_vert[0,0,4,0]
+        if self.symm_padd:
+            # Symmetric padding 
+            y_a[:,:,0,:] += x[:,:,0,:]*K_vert[0,0,1,0] + x[:,:,1,:]*K_vert[0,0,0,0]
+            if (x.shape[-2] % 2)==1: # odd number of rows
+                y_a[:,:,-1,:] += x[:,:,-1,:]*K_vert[0,0,3,0] + x[:,:,-2,:]*K_vert[0,0,4,0]
+            else: # even number of rows
+                y_a[:,:,-1,:] += x[:,:,-1,:]*K_vert[0,0,4,0]
 
         H = y_a.shape[-2]
         y = Func.conv2d(y_a.view(-1,1,H,W), K_horiz, stride=(1,2), padding=(0,2)).view(B,C,H,-1)
 
-        # Symmetric padding 
-        y[:,:,:,0] += y_a[:,:,:,0]*K_horiz[0,0,0,1] + y_a[:,:,:,1]*K_horiz[0,0,0,0]
-        if (x.shape[-2] % 2)==1: # odd number of columns
-            y[:,:,:,-1] += y_a[:,:,:,-1]*K_horiz[0,0,0,3] + y_a[:,:,:,-2]*K_horiz[0,0,0,4]
-        else: # even number of columns
-            y[:,:,:,-1] += y_a[:,:,:,-1]*K_horiz[0,0,0,4] 
+        if self.symm_padd:
+            # Symmetric padding 
+            y[:,:,:,0] += y_a[:,:,:,0]*K_horiz[0,0,0,1] + y_a[:,:,:,1]*K_horiz[0,0,0,0]
+            if (x.shape[-2] % 2)==1: # odd number of columns
+                y[:,:,:,-1] += y_a[:,:,:,-1]*K_horiz[0,0,0,3] + y_a[:,:,:,-2]*K_horiz[0,0,0,4]
+            else: # even number of columns
+                y[:,:,:,-1] += y_a[:,:,:,-1]*K_horiz[0,0,0,4] 
 
         return y
 
