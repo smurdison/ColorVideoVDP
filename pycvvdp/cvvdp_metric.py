@@ -11,7 +11,6 @@ import numpy as np
 import os
 import sys
 import json
-#import argparse
 #import time
 #import math
 import torch.utils.benchmark as torchbench
@@ -30,7 +29,6 @@ from pycvvdp.visualize_diff_map import visualize_diff_map
 from pycvvdp.video_source import *
 
 from pycvvdp.vq_metric import *
-#from pycvvdp.colorspace import lms2006_to_dkld65
 
 # For debugging only
 # from gfxdisp.pfs.pfs_torch import pfs_torch
@@ -128,8 +126,9 @@ class cvvdp(vq_metric):
         self.mask_c = torch.as_tensor( parameters['mask_c'], device=self.device ) # content masking adjustment
         self.pu_dilate = parameters['pu_dilate']
         if self.pu_dilate>0:
-            self.pu_blur = GaussianBlur(int(self.pu_dilate*4)+1, self.pu_dilate)
-            self.pu_padsize = int(self.pu_dilate*2)
+            #self.pu_blur_pt = GaussianBlur(int(self.pu_dilate*4)+1, self.pu_dilate)
+            self.pu_blur = utils.ImGaussFilt(self.pu_dilate, device=self.device)
+            #self.pu_padsize = int(self.pu_dilate*2)
             
         self.beta = torch.as_tensor( parameters['beta'], device=self.device ) # The exponent of the spatial summation (p-norm)
         self.beta_t = torch.as_tensor( parameters['beta_t'], device=self.device ) # The exponent of the summation over time (p-norm)
@@ -863,11 +862,11 @@ class cvvdp(vq_metric):
         return Dc
 
 
-    def phase_uncertainty(self, M):
-        # Blur only when the image is larger then the required pad size
-        if self.pu_dilate != 0 and M.shape[-2]>self.pu_padsize and M.shape[-1]>self.pu_padsize:
-            #M_pu = utils.imgaussfilt( M, self.pu_dilate ) * torch.pow(10.0, self.mask_c)
-            M_pu = self.pu_blur.forward(M) * (10**self.mask_c)
+    def phase_uncertainty(self, M):        
+        if self.pu_dilate != 0: # and M.shape[-2]>self.pu_padsize and M.shape[-1]>self.pu_padsize:
+            #M_pu = utils.imgaussfilt( M, self.pu_dilate ) * (10**self.mask_c)
+            M_pu = self.pu_blur.run(M) * (10**self.mask_c)
+            #M_pu = self.pu_blur_pt.forward(M) * (10**self.mask_c)
         else:
             M_pu = M * (10**self.mask_c)
         return M_pu

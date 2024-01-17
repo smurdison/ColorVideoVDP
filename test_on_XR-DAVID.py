@@ -46,7 +46,7 @@ distortion = "Dither_Level003"
 ref_file = media_folder + "/" +  video + '_reference_Level001.mp4'
 TST_FILEs = glob.glob(media_folder + "/" + video + '_' + distortion + '.mp4')
 
-logging.basicConfig(format='[%(levelname)s] %(message)s', level=logging.DEBUG)
+logging.basicConfig(format='[%(levelname)s] %(message)s', level=logging.INFO)
 
 config_paths = [media_folder, "../metric_configs/cvvdp_no_masking/cvvdp_parameters.json"]
 #config_paths = [media_folder]
@@ -64,4 +64,4 @@ for tst_fname in TST_FILEs:
 
     print( 'Quality for {}: {:.3f} JOD (took {:.4f} secs to compute)'.format(tst_fname, Q_JOD_static, end-start) )
 
-    cvvdp.export_distogram( stats_static, video + '_' + distortion + '_distogram.pdf', jod_max=10, base_size=3.5 )
+    #cvvdp.export_distogram( stats_static, video + '_' + distortion + '_distogram.pdf', jod_max=10, base_size=3.5 )

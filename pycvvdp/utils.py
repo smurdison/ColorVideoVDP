@@ -116,14 +116,20 @@ class ImGaussFilt():
         if len(img.shape) == 2: img_4d = img.reshape((1,1,img.shape[0],img.shape[1]))
         else:                   img_4d = img
 
-        pad = (
-            self.half_filter_size,
-            self.half_filter_size,
-            self.half_filter_size,
-            self.half_filter_size,)
+        h, w = img_4d.shape[-2], img_4d.shape[-1]
+        channels = img_4d.shape[-3]
+        img_4d = img_4d.view( -1, 1, h, w )
 
-        img_4d = Func.pad(img_4d, pad, mode='reflect')
-        return Func.conv2d(img_4d, self.K)[0,0]
+        # pad = ( # left, right, top, bottom
+        #     min( self.half_filter_size, img.shape[-1]-1 ),
+        #     min( self.half_filter_size, img.shape[-1]-1 ),
+        #     min( self.half_filter_size, img.shape[-2]-1 ),
+        #     min( self.half_filter_size, img.shape[-2]-1 ) )
+
+        # img_4d = Func.pad(img_4d, pad, mode='reflect')
+        # return Func.conv2d(img_4d, self.K).view( -1, channels, h, w )
+
+        return Func.conv2d(img_4d, self.K, padding='same').view( -1, channels, h, w )
 
 
 class config_files:
