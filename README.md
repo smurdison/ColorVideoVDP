@@ -1,24 +1,27 @@
 # ColorVideoVDP: A visible difference predictor for colour images and videos
 
-**[BETA RELEASE]**
+[Web page](https://www.cl.cam.ac.uk/research/rainbow/projects/colorvideovdp/) | [Paper](https://www.cl.cam.ac.uk/~rkm38/pdfs/mantiuk2024_ColorVideoVDP.pdf)
+
+![ColorVideoVDP logo](imgs/cvvdp_logo_256.png) ![ColorVideoVDP graphical abstract](https://www.cl.cam.ac.uk/research/rainbow/projects/colorvideovdp/reports/2024_cvvdp_graph_abstract_larger.gif)
 
 ColorVideoVDP is a full-reference visual quality metric that predicts the perceptual difference between pairs of images or videos. Similar to popular metrics like PSNR, SSIM, and DeltaE 2000 it is aimed at comparing a ground truth reference against a distorted (e.g. blurry, noisy, color-shifted) version. 
 
 This metric is unique because it is the first color-aware metric that accounts for spatial and temporal aspects of vision. 
 
 The main features:
-* models chromatic and achromatic contrast sensitivity using a novel contrast sensitivity model (castleCSF), allowing us to predict distortions in color and luminance;
+* models chromatic and achromatic contrast sensitivity using a novel contrast sensitivity model ([castleCSF](http://dx.doi.org/10.1167/jov.24.4.5)), allowing us to predict distortions in color and luminance;
 * models spatio-temporal sensitivity so that it can predict visibility of artifacts like waveguide nonuniformity and other temporally varying artifacts;
 * works with colorimetrically calibrated content, both SDR and HDR (any colour space);
 * can predict a single number quality correlate, a distortion map or a visualization of an error over time and visual channels (distogram). 
 
 ColorVideoVDP is implemented in PyTorch and can be run efficiently on a CUDA-enabled GPU. It can also run on a CPU, but the processing times will be much longer, especially for video. Its usage is described [below](#example-usage).
 
-The details of the metric will be available in our upcoming paper:
+The metric is explained in details in:
 
-> ColorVideoVDP: A Visible Difference Predictor for Images and Video.
-> Rafal K. Mantiuk, Param Hanji, Maliha Ashraf, Yuta Asano, Alexandre Chapiro.
-> Paper in preparation.
+> ColorVideoVDP: A visual difference predictor for image, video and display distortions.\
+> Rafal K. Mantiuk, Param Hanji, Maliha Ashraf, Yuta Asano, Alexandre Chapiro.\
+> In SIGGRAPH 2024 Technical Papers, Article 129\
+> https://doi.org/10.1145/3658144
 
 If you use the metric in your research, please cite the paper above. 
 
@@ -31,12 +34,17 @@ conda activate cvvdp
 
 2. Install PyTorch by following [these instructions](https://pytorch.org/get-started/locally/) (OS-specific). **If you have an Nvidia GPU with appropriate drivers, it is recommended to install with conda for proper CUDA support**. To use MPS on a Mac, please install torch>=2.1.0.
 
-3. Install [ffmpeg](https://ffmpeg.org/). The easiest option is to install using conda,
+2.a. [optional] If you plan on running on GPU (CUDA) install `pynvml`. 
 ```bash
-conda install ffmpeg
+pip install pynvml
 ```
 
-4. Obtain the ColourVDP codebase, by extracting a `.zip` file provided or cloning from Github:
+3. Install [ffmpeg](https://ffmpeg.org/) and [FreeImage](https://freeimage.sourceforge.io/). The easiest option is to install using conda,
+```bash
+conda install ffmpeg conda-forge::freeimage
+```
+
+4. Obtain the ColourVDP codebase, by cloning the repository:
 ```bash
 git clone git@github.com:gfxdisp/ColorVideoVDP.git   # skip if a .zip is provided or you use Github GUI
 ```
@@ -57,6 +65,46 @@ The test and reference files can be images or videos. The option `--display` spe
 
 See [Command line interface](#command-line-interface) for further details. ColorVideoVDP can be also run directly from Python - see [Low-level Python interface](#low-level-python-interface). 
 
+## Examples
+
+Compare all `feris-test-*.mp4` files with the same reference `feris-ref.mp4` using a custom display model, store results in a CSV file `res.csv`:
+```bash
+cvvdp --test example_media/structure/ferris-test-*.mp4 --ref example_media/structure/ferris-ref.mp4 --config-paths=display_models_custom.json --display my_display --result res.csv
+```
+where the custom display is described in a JSON file `display_models_custom.json`:
+```json
+{
+  "my_display": {
+    "name": "30-inch 4K monitor, peak luminance 200 cd/m^2, viewed under office light levels (250 lux), seen from 2 x display height", 
+    "resolution": [1920, 1080], 
+    "viewing_distance_meters":  1.0,  
+    "diagonal_size_inches": 22,   
+    "max_luminance": 500,   
+    "contrast": 3000,
+    "E_ambient": 100,
+    "k_refl": 0.01,
+    "source": "none" } 
+}
+```
+Note that the file name must be `display_models_*.json`. The format of this file is explained [here](pycvvdp/vvdp_data/README.md).
+
+Compare two 30 fps video files stored as PNG frames:
+```bash
+cvvdp --test test_frame_%05d.png --ref reference_frame_%05d.png --display standard_4k --fps 30
+```
+
+The same as above, but use only frames 10, 12, 14, ... Use Matlab's range notation to select frames.
+```bash
+cvvdp --test test_frame_%05d.png --ref reference_frame_%05d.png --display standard_4k --fps 30 --frames 10:2:
+```
+
+Compare two HDR video files. Note that a display model with the right EOTF must be used.
+```bash
+cvvdp --test test_hdr_video.mp4 --ref reference_hdr_video.mp4 --display standard_hdr_pq
+```
+
+Check [examples](examples/) showing how to call ColorVideoVDP from Python or [matlab](matlab/) showing how to run a Matlab wrapper.
+
 **Table of contents**
 - [Display specification](#display-specification)
     - [Custom specification](#custom-display-specification)
@@ -67,15 +115,20 @@ See [Command line interface](#command-line-interface) for further details. Color
     - [Command line interface](#command-line-interface)
     - [Visualization](#visualization)
     - [Configuration files](#configuration-files)
-    - [Low-level Python interface](#low-level-python-interface)
+    - [Other metrics](#other-metrics)
+    - [Display model preview](#display-model-preview)
+    - [Interactive mode](#Interactive-mode)
+    - [Python interface](#python-interface)
+    - [Loss function](#loss-function)
     - [Matlab interface](#matlab-interface)
+- [How to report issues?](#how-to-report-issues)
 - [Release notes](#release-notes)
 
 ## Display specification
 
 Unlike most image quality metrics, ColorVideoVDP needs physical specification of the display (e.g. its size, resolution, peak brightness) and viewing conditions (viewing distance, ambient light) to compute accurate predictions. The specifications of the displays are stored in [vvdp_data/display_models.json](pycvvdp/vvdp_data/display_models.json). You can add the exact specification of your display to this file, or create a new JSON file and pass the directory it is located in as `--config-paths` parameter (see [Configuration files](#configuration-files)). If the display specification is unknown to you, you are encouraged to use one of the standard display specifications listed on the top of that file, for example `standard_4k`, or `standard_fhd`. If you use one of the standard displays, there is a better chance that your results will be comparable with other studies. 
 
-You specify the display by passing `--display` argument to `cvvdp`.
+You specify the display by passing `--display` argument to `cvvdp`. Run with `--display ?` to get a list of available display models. 
 
 Note the the specification in `display_models.json` is for the display and not the image. If you select to use `standard_4k` with the resolution of 3840x2160 for your display and pass a 1920x1080 image, the metric will assume that the image occupies one quarter of that display (the central portion). If you want to enlarge the image to the full resolution of the display, pass `--full-screen-resize {fast_bilinear,bilinear,bicubic,lanczos}` option (for now it works with video only). 
 
@@ -106,7 +159,7 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/path/to/conda/miniconda3/lib
 ## Reporting metric results
 
 When reporting the results of the metric, please include the string returned by the metric, such as:
-`"ColorVideoVDP v0.3, 75.4 [pix/deg], Lpeak=200, Lblack=0.5979 [cd/m^2], (standard_4k)"`
+`"ColorVideoVDP v0.4.1, 75.4 [pix/deg], Lpeak=200, Lblack=0.5979 [cd/m^2], (standard_4k)"`
 This is to ensure that you provide enough details to reproduce your results. 
 
 ## Predicted quality scores
@@ -144,11 +197,11 @@ To predict quality with ColorVideoVDP (shown below), run:
 cvvdp --test example_media/structure/ferris-test-*.mp4 --ref example_media/structure/ferris-ref.mp4 --display standard_fhd --heatmap supra-threshold --distogram
 ```
 
-|Original | ![ferris wheel](https://www.cl.cam.ac.uk/research/rainbow/projects/fovvideovdp/html_reports/github_examples/cvvdp/ferris-ref.gif) | Quality | **TODO:** adjust heatmaps |
+|Original | ![ferris wheel](https://www.cl.cam.ac.uk/research/rainbow/projects/colorvideovdp/reports/heatmaps/ferris-ref.gif) | Quality | Heatmaps |
 | :---: | :---: | :---: | :---: |
-| Gaussian noise | ![noise](https://www.cl.cam.ac.uk/research/rainbow/projects/fovvideovdp/html_reports/github_examples/cvvdp/ferris-noise.gif) | DE00 = 33.5  <br /> CVVDP = 9.2140 | ![noise-heatmap](https://www.cl.cam.ac.uk/research/rainbow/projects/fovvideovdp/html_reports/github_examples/cvvdp/heatmaps/ferris-noise-supra.gif) |
-| Saturation | ![saturation](https://www.cl.cam.ac.uk/research/rainbow/projects/fovvideovdp/html_reports/github_examples/cvvdp/ferris-sat.gif) | DE00 = 33.5 <br /> CVVDP = 5.4020 | ![sat-heatmap](https://www.cl.cam.ac.uk/research/rainbow/projects/fovvideovdp/html_reports/github_examples/cvvdp/heatmaps/ferris-sat-supra.gif) |
-| Colorbalance | ![wb](https://www.cl.cam.ac.uk/research/rainbow/projects/fovvideovdp/html_reports/github_examples/cvvdp/ferris-wb.gif) | DE00 = 33.5 <br /> CVVDP = 5.6020 | ![wb-heatmap](https://www.cl.cam.ac.uk/research/rainbow/projects/fovvideovdp/html_reports/github_examples/cvvdp/heatmaps/ferris-wb-supra.gif) |
+| Gaussian noise | ![noise](https://www.cl.cam.ac.uk/research/rainbow/projects/colorvideovdp/reports/heatmaps/ferris-noise.gif) | DE00 = 33.5  <br /> CVVDP = 8.87 | ![noise-heatmap](https://www.cl.cam.ac.uk/research/rainbow/projects/colorvideovdp/reports/heatmaps/ferris-test-noise_heatmap.gif) |
+| Saturation | ![saturation](https://www.cl.cam.ac.uk/research/rainbow/projects/colorvideovdp/reports/heatmaps/ferris-sat.gif) | DE00 = 33.5 <br /> CVVDP = 6.55 | ![sat-heatmap](https://www.cl.cam.ac.uk/research/rainbow/projects/colorvideovdp/reports/heatmaps/ferris-test-sat_heatmap.gif) |
+| Colorbalance | ![wb](https://www.cl.cam.ac.uk/research/rainbow/projects/colorvideovdp/reports/heatmaps/ferris-wb.gif) | DE00 = 33.5 <br /> CVVDP = 5.59 | ![wb-heatmap](https://www.cl.cam.ac.uk/research/rainbow/projects/colorvideovdp/reports/heatmaps/ferris-test-wb_heatmap.gif) |
 
 ## Visualization
 
@@ -157,7 +210,7 @@ In addition to the single-valued quality scored in the JOD units, ColorVideoVDP 
 * `threshold` - the difference values between 0 and 1 will be mapped to green to red colors (visualizes small differences)
 * `raw` - the difference values between 0 and 10 will be mapped to back to white
 
-The `--distogram` command line argument can be followed by a floating point value. If present, it will be used as the maximum JOD value to use in the visualization. The default is 10.
+The `--distogram` command line argument can be followed by a floating point value. If present, it will be used as the maximum JOD degradation to use in the visualization. The default is 10.
 
 Both distogram and heatmap will be saved in the current directory and the filename will contain the name of the test image/video. To change the directory in which those files are saved, pass `--output-dir` option. 
 
@@ -177,7 +230,40 @@ To check which `display_models.json` file is used, run `cvvdp` with `--display ?
 
 To check which `cvvdp_parameters.json` file is used, run `cvvdp` with `--verbose`.
 
-## Low-level Python interface
+## Other metrics
+
+A command-line argument `--metric` can be used to specify one more more metric to run. The available options are:
+
+* `cvvdp` - ColorVideoVDP
+* `pu-psnr-rgb` - PSNR calculated on PU21-encoded RGB values (see [PU21](https://github.com/gfxdisp/PU21) for more info on PU21 encoding).
+* `pu-psnr-y` - PSNR calculated on PU21-encoded luminance values
+* `dm-preview` or `dm-preview-exr` - a fake metric that outputs either HDR h.265 (.mp4) video (`dm-preview`) or OpenEXR frames (`dm-preview-exr`) with the output of the display model. It can be used to check or debug the display model. Use `--output-dir` to specify the directory in which the files should be written.
+
+## Display model preview
+
+To preview the images/video that are sent to the metric (after applying a display model), pass `--metric dm-preview`. It will write OpenEXR images or HDR videos (`<base-name>-test.[exr|mp4]`, `<base-name>-reference.[exr|mp4]`) with the output of the display model. Those will be stored in the current directory or one specified with `--output-dir`. The files will contain absolute colour values, for example, `RGB=[100 100 100]` means D65 white at 100 nit luminance. 
+
+This functionality is useful if you suspect that video/images are incorrectly loaded or the display model is incorrectly used. You can use a scientific image viewer, such as pfsview from [pfstools](https://pfstools.sourceforge.net/), to preview the frames.
+
+You can also alternative versions of this debug "metric":
+* `--metric dm-preview-exr` - when processing video, OpenEXR frames will be written instead of a video file. 
+* `--metric dm-preview-sbs` - instead of creating two separate files, one for reference and one for test, put those in the same frame side-by-side. 
+* `--metric dm-preview-exr-sbs` - the two above combined
+
+## Interactive mode
+
+`cvvdp` will need to initialize PyTorch every time it starts, which will lead to a significant slow down when evaluating many files. To avoid this slowdown, you can start `cvvdp` in interactive mode by passing `--interactive` argument. When started that way, each line on the standard input should contain a complete list of argumens, as you would pass them to `cvvdp` program (but without the `cvvdp`). For example: 
+```bash
+> cvvdp --interactive
+--test example_media/aliasing/ferris-bicubic-bicubic.mp4 --ref example_media/aliasing/ferris-ref.mp4 --display "standard_fhd"
+--test example_media/aliasing/ferris-bicubic-nearest.mp4 --ref example_media/aliasing/ferris-ref.mp4 --display "standard_fhd"
+```
+You can obviously prepare a text file with those argumants and pass that file with the shell redirection `<`. The example above can be also run using wildcards:
+```bash
+cvvdp --test example_media/aliasing/ferris-*-*.mp4 --ref example_media/aliasing/ferris-ref.mp4 --display "standard_fhd"
+```
+
+## Python interface
 ColorVideoVDP can also be run through the Python interface by instatiating the `pycvvdp.cvvdp` class.
 
 ```python
@@ -196,15 +282,41 @@ Below, we show an example comparing ColorVideoVDP to the popular SSIM metric. Wh
 
 More examples can be found in these [example scripts](examples).
 
+## Loss function
+
+ColorVideoVDP can be used as a differentiable loss function in PyTorch. Use `cvvdp.loss` function for that. Examples of how to use ColorVideoVDP as a loss can be found in [examples/ex_adaptive_chroma_subsampling.py](examples/ex_adaptive_chroma_subsampling.py) and [examples/ex_image_reconstruction.py](examples/ex_image_reconstruction.py).
+
+A few caveats:
+* Similarly as many perceptual losses, ColorVideoVDP may disrupt the convexity of the loss landscape making the convergence slower or impossible.
+* Because of that, it is advisable that ColorVideoVDP is used in combination with well-behaved losses, such as L1 or L2.
+* Alternatively, ColorVideoVDP can be used at the latter training stage after the L1 or L2 solution has almost converged. 
+* The optimization will work much better on lower-dimensional problems in which only a few parameters are optimized. 
+
 ## Matlab interface
 
 There is no native implementation of ColorVideoVDP in Matlab, but you can use a wrapper that can be found in the [matlab](matlab/) directory.
 
-# Release notes
+# How to report issues?
 
-* v0.4.0 (10/January/2024) 
-  - An improved masking model
-  - Better predictions for temporal distortions
+Please use "Issues" tab in GitHub. 
+
+When reporting a problem, run `cvvdp` with `--verbose` argument and paste the entire output of the terminal, including the command line used to run `cvvdp`. If possible, include images/video on which the problem can be reproduced. 
+
+# Release notes
+* v0.4.2 (29/September/2024)
+  - Added: Support for HLG EOTF (e.g. iPhone HDR video) - thanks to Cosmin Stejerean
+  - Added: `--dump-channels` for generating videos with intermediate processing stages (debugging and visualization)
+  - Added: Processing of videos stored as image frames, described using the C-notation `frame_%04d.png`. New arguments: '--fps' and '--frames'
+  - Fixed: A better memory model for estimating how many frames can be processed at once on a GPU. Added '--gpu-mem' argument.
+  - Added: 'exposure' field in a display model JSON file
+
+* v0.4.1 (27/April/2024) 
+  - Added `loss` function to cvvdp and examples showing how to use it in `examples/ex_adaptive_chroma_subsampling.py` and `ex_image_reconstruction.py`.
+  - Added `--metric dm-preview` for previewing or debugging of the display model
+
+* v0.4.0 (19/January/2024) 
+  - An improved masking model and supra-threshold contrast coding
+  - A new calibration with a small improvement in performance
   - Matlab wrapper
 
 * v0.3.0 (04/Sep/2023) - First public release

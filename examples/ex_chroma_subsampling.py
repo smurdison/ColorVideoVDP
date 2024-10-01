@@ -1,3 +1,11 @@
+# This is an example showing how ColorVideoVDP can be used as a loss function to adaptively reduce chromatic details in YCbCr color space. 
+# It will reproduce example from Fig. 20 in ColorVideoVDP paper (https://doi.org/10.1145/3658144). 
+# See Section 6.1 in that paper for the full explanation. 
+
+# Important: This and other examples should be executed from the main ColorVideoVDP directory:
+# python examples/ex_<...>.py
+
+
 import os
 import numpy as np
 import matplotlib
@@ -5,7 +13,6 @@ import matplotlib.pyplot as plt
 import torch
 import ex_utils as utils
 import pycvvdp
-#from pycvvdp.colorspace import ColorTransform
 from pycvvdp.video_source import reshuffle_dims
 import torchvision.transforms as tt
 import math
@@ -23,20 +30,11 @@ def resize_array(img, dsize):
 # For debugging only
 # from gfxdisp.pfs.pfs import pfs
 
-# This is a 16-bit image, convert to float
 I_ref_np16 = pycvvdp.load_image_as_array(os.path.join('example_media', 'wavy_facade.png'))
 
 patch_sz = 256 # Use only a portion of the image
+# This is a 16-bit image, convert to float
 I_ref = I_ref_np16[-patch_sz:,-patch_sz:,:].astype(np.float32) / np.iinfo(I_ref_np16.dtype).max
-
-# I_ref = reshuffle_dims( torch.as_tensor(I_ref_np), "HWC", "CFHW" )
-# ct = ColorTransform()
-# I_DKL = ct.rgb2colourspace(I_ref, "DKLd65")
-
-# sigma = 4
-# GB = tt.GaussianBlur(math.ceil(sigma*3)*2+1, sigma)
-# for cc in range(1, 3):
-#     I_DKL[cc,:,:,:] = GB(I_DKL[cc,:,:,:])
 
 epsilon = 1e-4 # to avoid div by 0
 I_Yxy = utils.im_ctrans( utils.im_ctrans( I_ref, 'srgb', 'rgb709' ) + epsilon, 'rgb709', 'Yxy' )

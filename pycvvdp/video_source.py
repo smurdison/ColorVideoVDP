@@ -122,6 +122,42 @@ def reshuffle_dims( T: Tensor, in_dims: str, out_dims: str ) -> Tensor:
     return T_p.reshape( out_sh )
 
 
+def numpy2torch_frame(np_array, frame, device, dim_order="HWC" ):
+
+    if isinstance( np_array, np.ndarray ):
+        if np_array.dtype == np.uint16:
+            # Torch does not natively support uint16. A workaround is to pack uint16 values into int16.
+            # This will be efficiently transferred and unpacked on the GPU.
+            # logging.info('Test has datatype uint16, packing into int16')
+            np_array = np_array.astype(np.int16)
+        torch_array = torch.tensor(np_array)
+    else:
+        torch_array = np_array # If it is already a tensor
+
+    from_array = reshuffle_dims( torch_array, in_dims=dim_order, out_dims="BCFHW" )
+
+    if from_array.dtype is torch.float32:
+        frame = from_array[:,:,frame:(frame+1),:,:].to(device)
+    elif from_array.dtype is torch.float16:
+        frame = from_array[:,:,frame:(frame+1),:,:].to(device=device, dtype=torch.float32)
+    elif from_array.dtype is torch.int16:
+        # Use int16 to losslessly pack uint16 values
+        # Unpack from int16 by bit masking as described in this thread:
+        # https://stackoverflow.com/a/20766900
+        # logging.info('Found int16 datatype, unpack into uint16')
+        max_value = 2**16 - 1
+        # Cast to int32 to store values >= 2**15
+        frame_int32 = from_array[:,:,frame:(frame+1),:,:].to(device).to(torch.int32)
+        frame_uint16 = frame_int32 & max_value
+        # Finally convert to float in the range [0,1]
+        frame = frame_uint16.to(torch.float32) / max_value
+    elif from_array.dtype is torch.uint8:
+        frame = from_array[:,:,frame:(frame+1),:,:].to(device).to(torch.float32)/255
+    else:
+        raise RuntimeError( f"Only uint8, uint16 and float32 is currently supported. {from_array.dtype} encountered." )
+    return frame
+
+
 """
 This video_source uses a photometric display model to convert input content (e.g. sRGB) to luminance maps. 
 """
@@ -140,36 +176,7 @@ class video_source_dm( video_source ):
 
     def apply_dm_and_colour_transform(self, frame, target_colorspace):
 
-        if target_colorspace in ['display_encoded_01', 'display_encoded_dmax', 'display_encoded_100nit']: # if a display-encoded frame is requested
-
-            # Special case - if PQ, we still want to use PU21, as it should be marginally better
-            if self.dm_photometry.is_input_display_encoded() and not (isinstance( self.dm_photometry, vvdp_display_photo_eotf) and self.dm_photometry.EOTF == 'PQ'):
-                I = frame # no need to do anything
-            else:
-                # Otherwise, we need to PU-encode the frame
-                if not hasattr( self, "PU" ):
-                    self.PU = utils.PU()
-
-                if target_colorspace == 'display_encoded_01':
-                    PU_max = self.PU.encode(torch.as_tensor(10000.0))
-                elif target_colorspace == 'display_encoded_100nit':
-                    PU_max = self.PU.encode(torch.as_tensor(100.0))
-                else:
-                    PU_max = self.PU.encode(torch.as_tensor(self.dm_photometry.get_peak_luminance()))
-                
-                I_lin = self.dm_photometry.forward( frame )
-                I = self.PU.encode(I_lin) / PU_max # White diffuse of 100 nit will be mapped to 1
-
-        else: # If one of the standard linear color spaces is requested
-            I = self.dm_photometry.source_2_target_colourspace(frame, target_colorspace)
-
-            # L_lin = self.dm_photometry.forward( frame )
-
-            # is_color = (frame.shape[-4]==3)
-            # if is_color:
-            #     I = self.color_trans.rgb2colourspace(L_lin, colorspace)
-            # else:
-            #     I = L_lin
+        I = self.dm_photometry.source_2_target_colourspace(frame, target_colorspace)
 
         self.check_if_valid(I, target_colorspace)
         return I

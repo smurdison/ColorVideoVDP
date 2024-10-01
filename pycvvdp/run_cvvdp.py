@@ -14,11 +14,15 @@ import re
 
 import pycvvdp
 
+import shlex
+
 #from pyfvvdp.fvvdp_display_model import fvvdp_display_photometry, fvvdp_display_geometry
 # from pyfvvdp.visualize_diff_map import visualize_diff_map
 import pycvvdp.utils as utils
 
 from pycvvdp.ssim_metric import ssim_metric
+from pycvvdp.dm_preview import dm_preview_metric
+from pycvvdp.dump_channels import DumpChannels
 
 def expand_wildcards(filestrs):
     if not isinstance(filestrs, list):
@@ -26,7 +30,7 @@ def expand_wildcards(filestrs):
     files = []
     for filestr in filestrs:
         if "*" in filestr:
-            curlist = glob.glob(filestr)
+            curlist = sorted( glob.glob(filestr) )
             files = files + curlist
         else:
             files.append(filestr)
@@ -72,7 +76,7 @@ def np2img(np_srgb, imgfile):
 # -----------------------------------
 # Command-line Arguments
 # -----------------------------------
-def parse_args():
+def parse_args(arg_list=None):
     parser = argparse.ArgumentParser(description="Evaluate ColourVideoVDP on a set of videos")
     parser.add_argument("-t", "--test", type=str, nargs='+', required = False, help="list of test images/videos")
     parser.add_argument("-r", "--ref", type=str, nargs='+', required = False, help="list of reference images/videos")
@@ -81,28 +85,39 @@ def parse_args():
     parser.add_argument("-g", "--distogram", type=float, default=-1, const=10, nargs='?', help="generate a distogram that visualizes the differences per-channel and per frame. The optional floating point parameter is the maximum JOD value to use in the visualization.")
     parser.add_argument("-x", "--features", action='store_true', default=False, help="generate JSON files with extracted features. Useful for retraining the metric.")
     parser.add_argument("-o", "--output-dir", type=str, default=None, help="in which directory heatmaps and feature files should be stored (the default is the current directory)")
+    parser.add_argument("--result", type=str, default=None, help="write metric prediction results to a CSV file passed as an argument.")
     parser.add_argument("-c", "--config-paths", type=str, nargs='+', default=[], help="One or more paths to configuration files or directories. The main configurations files are `display_models.json`, `color_spaces.json` and `cvvdp_parameters.json`. The file name must start as the name of the original config file.")
     parser.add_argument("-d", "--display", type=str, default="standard_4k", help="display name, e.g. 'HTC Vive', or ? to print the list of models.")
     parser.add_argument("-n", "--nframes", type=int, default=-1, help="the number of video frames you want to compare")
     parser.add_argument("-f", "--full-screen-resize", choices=['bilinear', 'bicubic', 'nearest', 'area'], default=None, help="Both test and reference videos will be resized to match the full resolution of the display. Currently works only with videos.")
-    parser.add_argument("-m", "--metric", choices=['cvvdp', 'pu-psnr-rgb', 'pu-psnr-y', 'ssim'], nargs='+', default=['cvvdp'], help='Select which metric(s) to run')
+    parser.add_argument("-m", "--metric", choices=['cvvdp', 'pu-psnr-rgb', 'pu-psnr-y', 'ssim', 'dm-preview', 'dm-preview-exr', 'dm-preview-sbs', 'dm-preview-exr-sbs'], nargs='+', default=['cvvdp'], help='Select which metric(s) to run')
     parser.add_argument("--temp-padding", choices=['replicate', 'circular', 'pingpong'], default='replicate', help='How to pad the video in the time domain (for the temporal filters). "replicate" - repeat the first frame. "pingpong" - mirror the first frames. "circular" - take the last frames.')
     parser.add_argument("--pix-per-deg", type=float, default=None, help='Overwrite display geometry and use the provided pixels per degree value.')
+    parser.add_argument("--fps", type=float, default=None, help='Frames per second. It will overwrite frame rate stores in the video file. Required when passing an array of image files.')
+    parser.add_argument("--frames", type=str, default=None, help='Range of frames specified as first:step:last, first:last, or first: (Matlab notation). Currently works only with frames provided as images.')
+    parser.add_argument("--gpu-mem", type=float, default=None, help='How much GPU memory can we use in GB. Use if CUDA reports out of mem errors, or you want to run multiple instances at the same time.')
     parser.add_argument("-q", "--quiet", action='store_true', default=False, help="Do not print any information but the final JOD value. Warning message will be still printed.")
     parser.add_argument("-v", "--verbose", action='store_true', default=False, help="Print out extra information.")
     parser.add_argument("--ffmpeg-cc", action='store_true', default=False, help="Use ffmpeg for upsampling and colour conversion. Use custom pytorch code by default (faster and less memory).")
-    args = parser.parse_args()
+    parser.add_argument("-i", "--interactive", action='store_true', default=False, help="Run in an interactive mode, in which command line arguments are provided to the standard input, line by line. Saves on start-up time when running a large number of comparisons.")
+    parser.add_argument("--dump-channels", nargs='+', choices=['temporal', 'lpyr', 'difference'], default=None, help="Output video/images with intermediate processing stages (for debugging and visualization).")
+    if arg_list is not None:
+        args = parser.parse_args(arg_list)
+    else:
+        args = parser.parse_args()
     return args
 
-def main():
-    args = parse_args()
-
+def run_on_args(args):
     if args.quiet:
         log_level = logging.ERROR
     else:        
         log_level = logging.DEBUG if args.verbose else logging.INFO
         
     logging.basicConfig(format='[%(levelname)s] %(message)s', level=log_level)
+
+    if args.verbose:
+        import platform
+        logging.debug( f'Platform: {platform.platform()}' )
 
     if args.display == "?":
         pycvvdp.vvdp_display_photometry.list_displays(args.config_paths)
@@ -111,6 +126,23 @@ def main():
     if args.test is None or args.ref is None:
         logging.error( "Paths to both test and reference content needs to be specified.")
         return
+
+    # Range of frames to process
+    frame_range = None
+    if not args.frames is None:
+        ss = args.frames.split(':')
+        if len(ss) == 3:
+            sn = [0, 1, 10000] # default values
+        else:
+            sn = [0, 10000]
+        for kk in range(len(ss)):
+            if ss[kk].isnumeric():
+                sn[kk] = int(ss[kk])
+        if len(ss) == 3:
+            frame_range = range(sn[0],(sn[2]+1),sn[1])
+        elif len(ss) <= 2:
+            frame_range = range(sn[0],(sn[1]+1))
+        
 
 
     # Changed option to include MPS support for Macbooks
@@ -184,6 +216,14 @@ def main():
     else:
         display_geometry = pycvvdp.vvdp_display_geometry( [1024, 1024], ppd=args.pix_per_deg )
 
+    out_dir = "." if args.output_dir is None else args.output_dir
+    os.makedirs(out_dir, exist_ok=True)
+
+    if args.dump_channels:
+        dump_channels = DumpChannels( dump_temp_ch=("temporal" in args.dump_channels), dump_lpyr=("lpyr" in args.dump_channels), dump_diff=("difference" in args.dump_channels), output_dir=args.output_dir )
+    else:
+        dump_channels = None
+
     for mm in args.metric:
         if mm == 'cvvdp':
             fv = pycvvdp.cvvdp( display_photometry=display_photometry,
@@ -192,7 +232,9 @@ def main():
                                 device=device,
                                 temp_padding=args.temp_padding,
                                 config_paths=args.config_paths,
-                                quiet=args.quiet )
+                                quiet=args.quiet,
+                                gpu_mem=args.gpu_mem,
+                                dump_channels=dump_channels )
             metrics.append( fv )
         elif mm == 'pu-psnr-rgb':
             if args.heatmap:
@@ -206,6 +248,8 @@ def main():
             if args.heatmap:
                 logging.warning( f'Skipping heatmap as it is not supported by {mm}' )
             metrics.append( ssim_metric(device=device) )
+        elif mm.startswith( 'dm-preview' ):
+            metrics.append( dm_preview_metric(output_exr=("exr" in mm), side_by_side=("sbs" in mm), device=device) )
         else:
             raise RuntimeError( f"Unknown metric {mm}")
 
@@ -214,12 +258,21 @@ def main():
             logging.info( 'When reporting metric results, please include the following information:' )
             logging.info( info_str )
 
-    out_dir = "." if args.output_dir is None else args.output_dir
-    os.makedirs(out_dir, exist_ok=True)
+    if not args.result is None:
+        res_fh = open( args.result, "w" )
+        res_fh.write( 'test, reference' )
+        for mm in metrics:
+            res_fh.write( ', ' + mm.short_name() )
+        res_fh.write( '\n' )
+    else:
+        res_fh = None
+        
 
     for kk in range( max(N_test, N_ref) ): # For each test and reference pair
         test_file = args.test[min(kk,N_test-1)]
         ref_file = args.ref[min(kk,N_ref-1)]
+        if not res_fh is None:
+            res_fh.write( f"{test_file}, {ref_file}" )
         logging.info(f"Predicting the quality of '{test_file}' compared to '{ref_file}'")
         for mm in metrics:
             preload = False if args.temp_padding == 'replicate' else True
@@ -230,17 +283,25 @@ def main():
                                                 full_screen_resize=args.full_screen_resize, 
                                                 resize_resolution=display_geometry.resolution, 
                                                 frames=args.nframes,
+                                                fps=args.fps,
+                                                frame_range=frame_range,
                                                 preload=preload,
                                                 ffmpeg_cc=args.ffmpeg_cc,
                                                 verbose=args.verbose )
+
+                base, ext = os.path.splitext(os.path.basename(test_file))            
+                base_fname = os.path.join(out_dir, base)
+                mm.set_base_fname(base_fname)
+
                 Q_pred, stats = mm.predict_video_source(vs)
                 if args.quiet:
                     print( "{Q:0.4f}".format(Q=Q_pred) )
                 else:
                     units_str = f" [{mm.quality_unit()}]"
                     print( "{met_name}={Q:0.4f}{units}".format(met_name=mm.short_name(), Q=Q_pred, units=units_str) )
+                if not res_fh is None:
+                    res_fh.write( f", {Q_pred}" )
 
-                base, ext = os.path.splitext(os.path.basename(test_file))            
 
                 if args.features and not stats is None:
                     if mm == 'pu-psnr':
@@ -268,8 +329,31 @@ def main():
 
                 del stats
 
+        if not res_fh is None:
+            res_fh.write( "\n" )
+
+    if not res_fh is None:
+        res_fh.close()
+
     #     del test_vid
     #     torch.cuda.empty_cache()
+
+def main():
+    args = parse_args()
+
+    if args.interactive:
+        #print( "Running in an interactive mode" )
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                break
+
+            #print( shlex.split(line) )
+            args = parse_args(shlex.split(line))
+            run_on_args(args)
+    else:
+        run_on_args(args)
+
 
 if __name__ == '__main__':
     main()

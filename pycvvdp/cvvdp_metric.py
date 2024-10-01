@@ -1,6 +1,9 @@
 from abc import abstractmethod
 from urllib.parse import ParseResultBytes
-from numpy.lib.shape_base import expand_dims
+try:
+    from numpy import expand_dims
+except ImportErorr:
+    from numpy.lib.shape_base import expand_dims
 import math
 import torch
 from torch.utils import checkpoint
@@ -26,10 +29,19 @@ try:
 except:
     has_matplotlib = False
 
+try:
+    from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
+    has_nvml = True
+except:
+    has_nvml = False
+
 from pycvvdp.visualize_diff_map import visualize_diff_map
 from pycvvdp.video_source import *
 
 from pycvvdp.vq_metric import *
+
+from pycvvdp.dump_channels import DumpChannels
+
 #from pycvvdp.colorspace import lms2006_to_dkld65
 
 # For debugging only
@@ -73,11 +85,12 @@ def pow_neg( x:Tensor, p ):
 ColourVideoVDP metric. Refer to pytorch_examples for examples on how to use this class. 
 """
 class cvvdp(vq_metric):
-    def __init__(self, display_name="standard_4k", display_photometry=None, display_geometry=None, config_paths=[], heatmap=None, quiet=False, device=None, temp_padding="replicate", use_checkpoints=False, calibrated_ckpt=None):
+    def __init__(self, display_name="standard_4k", display_photometry=None, display_geometry=None, config_paths=[], heatmap=None, quiet=False, device=None, temp_padding="replicate", use_checkpoints=False, calibrated_ckpt=None, dump_channels=None, gpu_mem = None):
         self.quiet = quiet
         self.heatmap = heatmap
         self.temp_padding = temp_padding
         self.use_checkpoints = use_checkpoints # Used for training
+        self.gpu_mem = gpu_mem # how many GB of memory we are allowed to use
 
         assert heatmap in ["threshold", "supra-threshold", "raw", "none", None], "Unknown heatmap type"            
 
@@ -100,6 +113,8 @@ class cvvdp(vq_metric):
         self.load_config(config_paths)
         if calibrated_ckpt is not None:
             self.update_from_checkpoint(calibrated_ckpt)
+
+        self.dump_channels = dump_channels
 
         # if self.mask_s > 0.0:
         #     self.mask_p = self.mask_q + self.mask_s
@@ -227,7 +242,10 @@ class cvvdp(vq_metric):
             self.display_name = display_name
         else:
             self.display_photometry = display_photometry
-            self.display_name = "unspecified"
+            if hasattr(display_photometry, 'short_name'):
+                self.display_name = display_photometry.short_name
+            else:
+                self.display_name = "unspecified"
         
         if display_geometry is None:
             self.display_geometry = vvdp_display_geometry.load(display_name, config_paths)
@@ -265,7 +283,17 @@ class cvvdp(vq_metric):
         return self.predict_video_source(test_vs)
 
     '''
-    The same as `predict` but takes as input fvvdp_video_source_* object instead of Numpy/Pytorch arrays.
+    Compute a loss function between test and reference images/videos. Used as an optimization term in which the loss is minimized. 
+    '''
+    def loss(self, test_cont, reference_cont, dim_order="BCFHW", frames_per_second=0):
+
+        test_vs = video_source_array( test_cont, reference_cont, frames_per_second, dim_order=dim_order, display_photometry=self.display_photometry )
+        (Q_jod, stats) = self.predict_video_source(test_vs)
+        return (10.-Q_jod)
+
+
+    '''
+    The same as `predict` but takes as input fvvdp_video_source_* object instead of Numpy/Pytorch arrays. Video source is recommended when processing long videos as it allows frame-by-frame loading.
     '''
     def predict_video_source(self, vid_source):
         # We assume the pytorch default NCDHW layout
@@ -314,32 +342,8 @@ class cvvdp(vq_metric):
 
         if self.device.type == 'cuda' and torch.cuda.is_available() and not is_image:
             # GPU utilization is better if we process many frames, but it requires more GPU memory
-
-            # Determine how much memory we have
-            total = torch.cuda.get_device_properties(self.device).total_memory
-            allocated = torch.cuda.memory_allocated(self.device)
-            mem_avail = total-allocated-1500000000  # Total available - 1.5G
-
-            # Estimate how much we need for processing (may be inaccurate - to be improved)
             pix_cnt = width*height
-            # sw_buf            
-            mem_const = pix_cnt*4*3*2*(fl-1)
-            # sw_buf + R + B_bands + L_bkg_pyr + (T_f + R_f) + S
-            if self.debug: 
-                self.mem_allocated_start = allocated
-                self.mem_allocated_peak = 0
-
-            #mem_per_frame = pix_cnt*4*3*2 + pix_cnt*4*all_ch*2 + int(pix_cnt*4*all_ch*2*1.33) + int(pix_cnt*4*2*1.33) + int(pix_cnt*4*2*1.33) + int(pix_cnt*4*1.33) 
-            if self.use_checkpoints:           
-                # More memory required when training. TODO: better way to detect when running with require_grad
-                mem_per_frame = pix_cnt*2000   # Estimated memory required per frame
-            else:
-                mem_per_frame = pix_cnt*450   # Estimated memory required per frame
-
-            max_frames = int((mem_avail-mem_const)/mem_per_frame) # how many frames can we fit into memory
-
-            block_N_frames = max(1, min(max_frames,N_frames))  # Process so many frames in one pass 
-            if self.debug: logging.debug( f"Processing {block_N_frames} frames in a batch." )
+            block_N_frames = self.estimate_block_N(pix_cnt, N_frames)
         else:
             block_N_frames = 1
 
@@ -347,6 +351,10 @@ class cvvdp(vq_metric):
             met_colorspace='logLMS_DKLd65'
         else:
             met_colorspace='DKLd65' # This metric uses DKL colourspaxce with d65 whitepoint
+
+        if self.dump_channels:
+            self.dump_channels.open(vid_source.get_frames_per_second())
+
 
         for ff in range(0, N_frames, block_N_frames):
             cur_block_N_frames = min(block_N_frames,N_frames-ff) # How many frames in this block?
@@ -362,6 +370,10 @@ class cvvdp(vq_metric):
                 if ff == 0: # First frame
                     sw_buf[0] = torch.zeros((1,3,fl+block_N_frames-1,height,width), device=self.device, dtype=torch.float32) # TODO: switch to float16
                     sw_buf[1] = torch.zeros((1,3,fl+block_N_frames-1,height,width), device=self.device, dtype=torch.float32)
+
+                    if self.debug and not hasattr( self, 'sw_buf_allocated' ):
+                        # Memory allocated after creating buffers for temporal filters 
+                        self.sw_buf_allocated = torch.cuda.max_memory_allocated(self.device)
 
                     if self.temp_padding == "replicate":
                         for fi in range(cur_block_N_frames):
@@ -421,6 +433,9 @@ class cvvdp(vq_metric):
                         R[:,cc*2+0, fi, :, :] = (sw_buf[0][:, sw_ch, fi:(fl+fi), :, :] * corr_filter).sum(dim=-3,keepdim=True) # Test
                         R[:,cc*2+1, fi, :, :] = (sw_buf[1][:, sw_ch, fi:(fl+fi), :, :] * corr_filter).sum(dim=-3,keepdim=True) # Reference
 
+            if self.dump_channels:
+                self.dump_channels.dump_temp_ch(R)
+
             if self.use_checkpoints:
                 # Used for training
                 Q_per_ch_block, heatmap_block = checkpoint.checkpoint(self.process_block_of_frames, R, vid_sz, temp_ch, self.lpyr, is_image, use_reentrant=False)
@@ -463,20 +478,63 @@ class cvvdp(vq_metric):
         stats['height'] = height
         stats['N_frames'] = N_frames
 
+        if self.dump_channels:
+            self.dump_channels.close()
+
         if self.do_heatmap:            
             stats['heatmap'] = heatmap
 
-        if self.debug and hasattr(self,"mem_allocated_peak"): 
-            logging.debug( f"Allocated at start: {self.mem_allocated_start/1e9} GB" )
-            logging.debug( f"Max allocated: {self.mem_allocated_peak/1e9} GB" )
+        if self.debug: 
+            logging.debug( f"Processing {block_N_frames} frames in a batch." )
             logging.debug( f"Resolution: {width}x{height} = {width*height/1e6} Mpixels" )
-            pix_cnt = width*height
+            mem_allocated_peak = torch.cuda.max_memory_allocated(self.device)            
+            # logging.debug( f"Memory allocated at start: {self.start_allocated/1e9} GB" )
+            if hasattr( self, "sw_buf_allocated" ):
+                logging.debug( f"Memory allocated for temp. filter buffers: {self.sw_buf_allocated/1e9} GB" )
+            logging.debug( f"Max memory allocated: {torch.cuda.max_memory_allocated()/1e9} GB" )
+            # pix_cnt = width*height
             # sw_buf            
-            mem_const = pix_cnt*4*3*2*(fl-1)
-            per_pixel = (self.mem_allocated_peak-self.mem_allocated_start-mem_const)/(pix_cnt*block_N_frames)
-            logging.debug( f"Memory used per pixel: {per_pixel} B" )
+            #mem_const = pix_cnt*4*3*2*(fl-1)            
+            # mem_sw_buf = self.sw_buf_allocated-self.start_allocated
+            # per_pixel_sw_buf = mem_sw_buf/(pix_cnt*(fl-1))
+            # per_pixel = (mem_allocated_peak-mem_sw_buf-self.start_allocated)/(pix_cnt*block_N_frames)
+            # logging.debug( f"Memory used per pixel for temporal filters: {per_pixel_sw_buf} B" )
+            # logging.debug( f"Memory used per pixel for block of frames: {per_pixel} B" )
 
         return (Q_jod.squeeze(), stats)
+
+    # Determine how many frames we can process in a single batch 
+    # Larger batch means faster processing, but it requires more memory
+    def estimate_block_N(self, pix_cnt, N_frames):
+        # Determine how much memory we have
+        if has_nvml:
+            # This is more accurate estimate
+            nvmlInit()
+            h = nvmlDeviceGetHandleByIndex(self.device.index)
+            info = nvmlDeviceGetMemoryInfo(h)
+            mem_avail = info.free - 1e9  # We reserving some space, not to use all the memory
+        else:
+            # Torch does not allow us to querry the free memory on the GPU so this is an inaccurate estimate - likely to fail if other applications are using a GPU
+            total = torch.cuda.get_device_properties(self.device).total_memory
+            allocated = torch.cuda.memory_allocated(self.device)
+            mem_avail = total-allocated - 2e9  # Total available minus 2G (used by other apps)
+
+        if not self.gpu_mem is None:
+            mem_avail = min(int(self.gpu_mem*1e9), mem_avail)
+
+        if self.debug:
+            logging.debug( f"Available memory: {mem_avail/1e9} GB")
+        # Estimate how much we need for processing
+        # The model is:  total_mem = a + pix_cnt*(N_frames+filter_len-1)*b + pix_cnt*N_frames*c
+        a = 1.6e9
+        b = 16
+        c = 320 if not self.use_checkpoints else 1000 # A different value for training
+
+        max_frames = int(math.floor((mem_avail-a-pix_cnt*(self.filter_len-1)*b)/(pix_cnt*b+pix_cnt*c))) # how many frames can we fit into memory
+
+        block_N_frames = max(1, min(max_frames,N_frames))  # Process so many frames in one pass 
+        return block_N_frames
+
 
     def get_ch_weights(self, no_channels):
         if hasattr(self, 'ch_chrom_w'):
@@ -583,6 +641,10 @@ class cvvdp(vq_metric):
 
         if self.debug: assert len(B_bands) == lpyr.get_band_count()
 
+        if self.dump_channels:
+            self.dump_channels.dump_lpyr(lpyr, B_bands)
+
+
         # if self.do_heatmap:
         #     Dmap_pyr_bands, Dmap_pyr_gbands = self.heatmap_pyr.decompose( torch.zeros([1,1,height,width], dtype=torch.float, device=self.device))
 
@@ -643,10 +705,20 @@ class cvvdp(vq_metric):
                 D_chr = self.lp_norm(D*per_ch_w, self.beta_tch, dim=-4, normalize=False)  # Sum across temporal and chromatic channels
                 self.heatmap_pyr.set_lband(bb, D_chr)
 
+            if self.dump_channels:
+                width = R.shape[-1]
+                height = R.shape[-2]
+                t_int = self.image_int if is_image else 1.0
+                per_ch_w = self.get_ch_weights( all_ch ).view(-1,1,1,1) * t_int
+                self.dump_channels.set_diff_band(width, height, lpyr.ppd, bb, D*per_ch_w)
+
         if self.do_heatmap:
             heatmap_block = 1.-(self.met2jod( self.heatmap_pyr.reconstruct() )/10.)
         else:
             heatmap_block = None
+
+        if self.dump_channels:
+            self.dump_channels.dump_diff()
 
         return Q_per_ch_block, heatmap_block
 
@@ -840,10 +912,6 @@ class cvvdp(vq_metric):
         else:
             raise RuntimeError( f"Unknown masking model {self.masking_model}" )
 
-        if self.debug and hasattr(self,"mem_allocated_peak"): 
-            allocated = torch.cuda.memory_allocated(self.device)
-            self.mem_allocated_peak = max( self.mem_allocated_peak, allocated )
-
         return D
 
     def clamp_diffs(self,D):
@@ -1008,7 +1076,7 @@ class cvvdp(vq_metric):
             standard_str = f'custom-display: {self.display_name}'
 
         L_black, L_refl = self.display_photometry.get_black_level()
-        return f'"ColourVideoVDP v{self.version}, {self.pix_per_deg:.4g} [pix/deg], ' \
+        return f'"ColorVideoVDP v{self.version}, {self.pix_per_deg:.4g} [pix/deg], ' \
                f'Lpeak={self.display_photometry.get_peak_luminance():.5g}, ' \
                f'Lblack={L_black:.4g}, Lrefl={L_refl:.4g} [cd/m^2], ({standard_str})"' 
 

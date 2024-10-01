@@ -41,6 +41,20 @@ def lms2006_to_dkld65( img ):
         ABC[...,cc,:,:,:] = torch.sum(img*(M[cc,:].view(1,3,1,1,1)), dim=-4, keepdim=True)
     return ABC
 
+def lin2pq( L ):
+    """ Convert from absolute linear values (between 0.005 and 10000) to PQ-encoded values V (between 0 and 1)
+    """
+    Lmax = 10000
+    #Lmin = 0.005
+    n    = 0.15930175781250000
+    m    = 78.843750000000000
+    c1   = 0.83593750000000000
+    c2   = 18.851562500000000
+    c3   = 18.687500000000000
+    im_t = (torch.clip(L,0,Lmax)/Lmax) ** n
+    V  = ((c2*im_t + c1) / (1+c3*im_t)) ** m
+    return V
+
 def pq2lin( V ):
     """ Convert from PQ-encoded values V (between 0 and 1) to absolute linear values (between 0.005 and 10000)
     """
@@ -65,6 +79,34 @@ def srgb2lin( p ):
     L = torch.where(p > 0.04045, ((p + 0.055) / 1.055)**2.4, p/12.92)
     return L
 
+
+# Convert pixel values to linear using the Rec. 2100 HLG non-linearity
+#
+# rgb_d = hlg2lin( rgb, gamma )
+#
+# rgb   - pixel values (between 0 and 1)
+# rgb_d - relative linear RGB (or luminance), normalized to the range 0-1
+def hlg2lin( rgb, gamma ):
+    # using formula from table 5 of
+    # https://www.itu.int/dms_pubrec/itu-r/rec/bt/R-REC-BT.2100-1-201706-S!!PDF-E.pdf
+
+    a = 0.17883277
+    b = 1 - 4 * a
+    c = 0.5 - a * math.log(4 * a)
+
+    # inverse OETF
+    rgb_s = torch.where(
+        rgb <= 0.5,
+        torch.pow(rgb, 2) / 3.0,
+        (torch.exp((rgb - c) / a) + b) / 12.0
+    )
+
+    # apply OOTF
+    Y_s = 0.2627 * rgb_s[:, 0] + 0.6780 * rgb_s[:, 1] + 0.0593 * rgb_s[:, 2]
+    rgb_d = (Y_s ** (gamma - 1)).unsqueeze(1) * rgb_s
+
+    return rgb_d
+
 class vvdp_display_photometry:
 
     def __init__( self, source_colorspace='sRGB', config_paths=[] ):
@@ -75,7 +117,8 @@ class vvdp_display_photometry:
         if not source_colorspace in colorspaces:
             raise RuntimeError( "Unknown color space: \"" + source_colorspace + "\"" )
 
-        self.rgb2xyz_list = [colorspaces[source_colorspace]['RGB2X'], colorspaces[source_colorspace]['RGB2Y'], colorspaces[source_colorspace]['RGB2Z'] ]
+        if 'RGB2X' in colorspaces[source_colorspace]: # luminance will not have colour space primaries
+            self.rgb2xyz_list = [colorspaces[source_colorspace]['RGB2X'], colorspaces[source_colorspace]['RGB2Y'], colorspaces[source_colorspace]['RGB2Z'] ]
         self.EOTF = colorspaces[source_colorspace]['EOTF']
 
 
@@ -138,14 +181,20 @@ class vvdp_display_photometry:
             E_ambient = model["E_ambient"]
         else:
             E_ambient = 0
-        
+
         # Reflectivity of the display panel
         if "k_refl" in model: 
             k_refl = model["k_refl"]
         else:
             k_refl = 0.005
 
-        obj = vvdp_display_photo_eotf( Y_peak, contrast=contrast, source_colorspace=colorspace, E_ambient=E_ambient, k_refl=k_refl, name=display_name, config_paths=config_paths)
+        # Exposure
+        if "exposure" in model:
+            exposure = model["exposure"]
+        else:
+            exposure = 1
+
+        obj = vvdp_display_photo_eotf( Y_peak, contrast=contrast, source_colorspace=colorspace, E_ambient=E_ambient, k_refl=k_refl, name=display_name, exposure=exposure, config_paths=config_paths)
         obj.full_name = model["name"]
         obj.short_name = display_name
 
@@ -155,14 +204,36 @@ class vvdp_display_photometry:
     # the colorimetric values of light emmitted from the display and then into the target colour
     # space used by a metric.
     def source_2_target_colourspace(self, I_src, target_colorspace):        
-        # Apply forward display model to get absolute linear values
-        I_lin = self.forward( I_src )
 
-        is_color = (I_src.shape[-4]==3)
-        if is_color:
-            I_target = self.linear_2_target_colourspace(I_lin, target_colorspace)
+
+        if target_colorspace in ['display_encoded_01', 'display_encoded_dmax', 'display_encoded_100nit']: # if a display-encoded frame is requested
+
+            # Special case - if PQ, we still want to use PU21, as it should be marginally better
+            if self.is_input_display_encoded() and not (isinstance( self, vvdp_display_photo_eotf) and self.EOTF == 'PQ'):
+                I_target = I_src # no need to do anything
+            else:
+                # Otherwise, we need to PU-encode the frame
+                if not hasattr( self, "PU" ):
+                    self.PU = utils.PU()
+
+                if target_colorspace == 'display_encoded_01':
+                    PU_max = self.PU.encode(torch.as_tensor(10000.0))
+                elif target_colorspace == 'display_encoded_100nit':
+                    PU_max = self.PU.encode(torch.as_tensor(100.0)) # White diffuse of 100 nit will be mapped to 1
+                else:
+                    PU_max = self.PU.encode(torch.as_tensor(self.get_peak_luminance()))
+                
+                I_lin = self.forward( I_src )
+                I_target = self.PU.encode(I_lin) / PU_max 
         else:
-            I_target = I_lin
+            # Apply forward display model to get absolute linear values
+            I_lin = self.forward( I_src )
+
+            is_color = (I_src.shape[-4]==3)
+            if is_color:
+                I_target = self.linear_2_target_colourspace(I_lin, target_colorspace)
+            else:
+                I_target = I_lin
 
         return I_target
 
@@ -186,7 +257,7 @@ class vvdp_display_photometry:
                 rgb2abc = torch.as_tensor( LMS2006_to_DKLd65, dtype=RGB_lin.dtype, device=RGB_lin.device) @ torch.as_tensor( XYZ_to_LMS2006, dtype=RGB_lin.dtype, device=RGB_lin.device) @ rgb2xyz
             elif target_colorspace=="RGB709":
                 rgb2abc = torch.as_tensor( XYZ_to_RGB709, dtype=RGB_lin.dtype, device=RGB_lin.device) @ rgb2xyz
-            elif target_colorspace=="RGB2020":
+            elif target_colorspace=="RGB2020" or target_colorspace=="RGB2020pq":
                 rgb2abc = torch.as_tensor( XYZ_to_RGB2020, dtype=RGB_lin.dtype, device=RGB_lin.device) @ rgb2xyz
             elif target_colorspace=="logLMS_DKLd65":
                 rgb2abc = torch.as_tensor( XYZ_to_LMS2006, dtype=RGB_lin.dtype, device=RGB_lin.device) @ rgb2xyz
@@ -200,13 +271,15 @@ class vvdp_display_photometry:
 
             if target_colorspace=="logLMS_DKLd65":
                 ABC = lms2006_to_dkld65( torch.log10(ABC) )
+            elif target_colorspace=="RGB2020pq":
+                ABC = lin2pq(ABC)
 
             return ABC
 
 class vvdp_display_photo_eotf(vvdp_display_photometry): 
     # Display model with several EOTF, to simulate both SDR and HDR displays
     #
-    # dm = fvvdp_display_photo_eotf( Y_peak, contrast, EOTF, gamma, E_ambient, k_refl )
+    # dm = vvdp_display_photo_eotf( Y_peak, contrast, EOTF, gamma, E_ambient, k_refl )
     #
     # Parameters (default value shown in []):
     # Y_peak - display peak luminance in cd/m^2 (nit), e.g. 200 for a typical
@@ -215,16 +288,18 @@ class vvdp_display_photo_eotf(vvdp_display_photometry):
     #          1000:1
     # source_colorspace - color space from colorspaces.json. colorspace entry includes EOTF, 
     #          but it can be overriden using EOTF parameter.
-    # EOTF - 'sRGB', 'PQ', 'linear' or a string with a numeric value, such as "2.2", for gamma 2.2
+    # EOTF - 'sRGB', 'PQ', 'linear' or a string with a numeric value, such as "2.2", for gamma 2.2. 
+    #        This parameter will overwrite the EOTF attribute in the JSON file with corresponding 'source_colorspace'.
     # E_ambient - [0] ambient light illuminance in lux, e.g. 600 for bright
     #         office
     # k_refl - [0.005] reflectivity of the display screen
+    # exposure - [1] exposure of the content. The colour in the linear colour space is multipled by this constant.
     #
     # For more details on the GOG display model, see:
     # https://www.cl.cam.ac.uk/~rkm38/pdfs/mantiuk2016perceptual_display.pdf
     #
     # Copyright (c) 2010-2022, Rafal Mantiuk
-    def __init__( self, Y_peak, contrast = 1000, source_colorspace='sRGB', EOTF=None, E_ambient = 0, k_refl = 0.005, name=None, config_paths=[] ):
+    def __init__( self, Y_peak, contrast = 1000, source_colorspace='sRGB', EOTF=None, E_ambient = 0, k_refl = 0.005, exposure=1, name=None, config_paths=[] ):
             
         super().__init__(source_colorspace=source_colorspace, config_paths=config_paths)
         if not EOTF is None: 
@@ -235,6 +310,7 @@ class vvdp_display_photo_eotf(vvdp_display_photometry):
         self.E_ambient = E_ambient
         self.k_refl = k_refl
         self.name = name    
+        self.exposure = exposure
 
     # Say whether the input frame is display-encoded. False if it is linear. 
     def is_input_display_encoded(self):
@@ -249,7 +325,8 @@ class vvdp_display_photo_eotf(vvdp_display_photometry):
             and self.contrast == other.contrast \
             and self.EOTF == other.EOTF \
             and self.E_ambient == other.E_ambient \
-            and self.k_refl == other.k_refl
+            and self.k_refl == other.k_refl \
+            and self.exposure == other.exposure
 
     # Transforms display-encoded pixel values V, which must be in the range
     # 0-1 into absolute linear colorimetric values emitted from
@@ -263,14 +340,27 @@ class vvdp_display_photo_eotf(vvdp_display_photometry):
         Y_black, Y_refl = self.get_black_level()
                 
         if self.EOTF=='sRGB':
-            L = (self.Y_peak-Y_black)*srgb2lin(V) + Y_black + Y_refl
+            if self.exposure == 1:
+                L = (self.Y_peak-Y_black)*srgb2lin(V) + Y_black + Y_refl
+            else:
+                L = (self.Y_peak-Y_black)*(srgb2lin(V)*self.exposure).clip(0., 1.) + Y_black + Y_refl
         elif self.EOTF=='PQ':
-            L = pq2lin( V ).clip(0.005, self.Y_peak) + Y_black + Y_refl #TODO: soft clipping
+            L = (pq2lin( V )*self.exposure).clip(0.005, self.Y_peak) + Y_black + Y_refl #TODO: soft clipping
         elif self.EOTF=='linear':
-            L = V.clip(max(0.005, Y_black), self.Y_peak) + Y_refl #TODO: soft clipping
+            L = (V*self.exposure).clip(max(0.005, Y_black), self.Y_peak) + Y_refl #TODO: soft clipping
+        elif self.EOTF=='HLG':
+            gamma = 1.2
+            if self.Y_peak > 1000:
+                # The correction term "- 0.07623 * math.log10(self.E_ambient / 5)" comes from BBC Research & Development White Paper WHP 369
+                # https://downloads.bbc.co.uk/rd/pubs/whp/whp-pdf-files/WHP369.pdf
+                gamma = 1.2 + 0.42 * math.log10(self.Y_peak / 1000) - 0.07623 * math.log10(self.E_ambient / 5)
+            if self.exposure == 1:
+                L = (self.Y_peak-Y_black)*hlg2lin(V, gamma) + Y_black + Y_refl
+            else:
+                L = (self.Y_peak-Y_black)*(hlg2lin(V, gamma)*self.exposure).clip(0., 1.) + Y_black + Y_refl
         elif self.EOTF[0].isnumeric(): # if the first char is numeric -> gamma
             gamma = float(self.EOTF)
-            L = (self.Y_peak-Y_black)*torch.pow(V, gamma) + Y_black + Y_refl
+            L = (self.Y_peak-Y_black)*(torch.pow(V, gamma)*self.exposure).clip(0., 1.) + Y_black + Y_refl
         else:
             raise RuntimeError( f"Unknown EOTF '{self.EOTF}'" )        
         return L
@@ -512,23 +602,27 @@ class vvdp_display_geometry:
             raise RuntimeError( 'Display model not found' )
 
         model = models[display_name]
+
         assert "resolution" in model
 
         inches_to_meters = 0.0254
 
         W, H = model["resolution"]
 
-        if "fov_diagonal" in model: fov_diagonal = model["fov_diagonal"]
-        else:                       fov_diagonal = None
+        if "pixels_per_degree" in model:
+            obj = vvdp_display_geometry( (W, H), ppd=model["pixels_per_degree"])
+        else:
+            if "fov_diagonal" in model: fov_diagonal = model["fov_diagonal"]
+            else:                       fov_diagonal = None
 
-        if   "viewing_distance_meters" in model: distance_m = model["viewing_distance_meters"]
-        elif "viewing_distance_inches" in model: distance_m = model["viewing_distance_inches"] * inches_to_meters
-        else:                                    distance_m = None
+            if   "viewing_distance_meters" in model: distance_m = model["viewing_distance_meters"]
+            elif "viewing_distance_inches" in model: distance_m = model["viewing_distance_inches"] * inches_to_meters
+            else:                                    distance_m = None
 
-        if   "diagonal_size_meters" in model: diag_size_inch = model["diagonal_size_meters"] / inches_to_meters
-        elif "diagonal_size_inches" in model: diag_size_inch = model["diagonal_size_inches"] 
-        else:                                 diag_size_inch = None
+            if   "diagonal_size_meters" in model: diag_size_inch = model["diagonal_size_meters"] / inches_to_meters
+            elif "diagonal_size_inches" in model: diag_size_inch = model["diagonal_size_inches"] 
+            else:                                 diag_size_inch = None
 
-        obj = vvdp_display_geometry( (W, H), distance_m=distance_m, fov_diagonal=fov_diagonal, diagonal_size_inches=diag_size_inch)
+            obj = vvdp_display_geometry( (W, H), distance_m=distance_m, fov_diagonal=fov_diagonal, diagonal_size_inches=diag_size_inch)
         return obj
 
