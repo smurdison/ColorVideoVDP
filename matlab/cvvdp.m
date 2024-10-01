@@ -9,7 +9,7 @@ classdef cvvdp
     % v.cmp( img_test, img_ref, 'standard_fhd' )
     %
     % The arguments and options passed to this class reflect those that are
-    % passed to `cvvdp` command line - check `cvvdp --help` for more information on those. 
+    % passed to `cvvdp` command line - check `cvvdp --help` for more information on those.
 
     properties
         conda_env
@@ -17,7 +17,7 @@ classdef cvvdp
     end
 
     methods
-        function obj = cvvdp(conda_env, device) 
+        function obj = cvvdp(conda_env, device)
             % conda_env - the name of the conda environment with installed
             %             cvvdp
             % device - device to run cvvdp on: 'cpu', 'mps', 'cuda:0', 'cuda:1', ...
@@ -40,7 +40,7 @@ classdef cvvdp
                 options.verbose (1,1) = false
                 options.config_paths {mustBeText} = ''
             end
-            
+
             if isa( img_test, 'double' )
                 img_test = single(img_test);
             end
@@ -48,8 +48,8 @@ classdef cvvdp
                 img_ref = single(img_ref);
             end
 
-            test_file = strcat( tempname(), '.mat' );
-            ref_file = strcat( tempname(), '.mat' );
+            test_file = strcat( tempname() , '.mat' );
+            ref_file = strcat( tempname() , '.mat' );
 
             ppd = options.ppd;
             fps = options.fps;
@@ -57,7 +57,7 @@ classdef cvvdp
             save( ref_file, 'img_ref', 'fps' )
             %imwrite( img_test, test_file );
             %imwrite( img_ref, ref_file );
-            
+
             if ppd>0
                 ppd_arg = sprintf( ' --pix-per-deg %g', ppd );
             else
@@ -69,12 +69,12 @@ classdef cvvdp
                 heatmap_arg = [ ' --heatmap ', options.heatmap, ' --output-dir "', strrep(tmp_dir, '\', '/'), '"' ];
             else
                 heatmap_arg = '';
-            end                
-            
-            cmd = [ 'conda activate ', obj.conda_env, '; cvvdp --test "', test_file, '" --ref "', ref_file, '" --display ', display, ppd_arg, heatmap_arg ]; 
-%             if ~options.verbose
-%                 cmd = [cmd, ' --quiet'];
-%             end
+            end
+
+            cmd = [ 'conda activate ', obj.conda_env, '; cvvdp --test "', test_file, '" --ref "', ref_file, '" --display ', display, ppd_arg, heatmap_arg ];
+            %             if ~options.verbose
+            %                 cmd = [cmd, ' --quiet'];
+            %             end
             if ~isempty( options.config_paths )
                 cmd = [cmd, ' --config-paths "', options.config_paths, '"'];
             end
@@ -102,12 +102,28 @@ classdef cvvdp
             end
 
             if ~strcmp(options.heatmap, 'none')
-                heatmap_fn = [ test_file(1:(end-4)), '_heatmap.png' ];
+                if length(size(img_test)) == 4
+                    heatmap_fn = [ test_file(1:(end-4)), '_heatmap.mp4' ];
+                    isVid = true;
+                else
+                    heatmap_fn = [ test_file(1:(end-4)), '_heatmap.png' ];
+                    isVid = false;
+                end
                 if ~isfile( heatmap_fn )
                     warning( 'cvvdp: Missing heatmap files - something went wrong' )
                     heatmap = [];
                 else
-                    heatmap = imread( heatmap_fn );
+                    if isVid
+                        hmVid = VideoReader( heatmap_fn );
+                        heatmap = zeros(hmVid.Height,hmVid.Width,3,hmVid.NumFrames);
+                        frameCount = 0;
+                        while hasFrame(hmVid)
+                            frameCount = frameCount+1;
+                            heatmap(:,:,:,frameCount) = double(readFrame(hmVid))/255;
+                        end
+                    else
+                        heatmap = imread( heatmap_fn );
+                    end
                     delete( heatmap_fn );
                 end
             else
@@ -115,7 +131,7 @@ classdef cvvdp
             end
 
             delete( test_file );
-            delete( ref_file );           
+            delete( ref_file );
 
         end
     end
